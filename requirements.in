@@ -1,0 +1,7 @@
+beautifulsoup4
+fastapi
+httpx
+ics
+redis
+slowapi
+uvicorn
