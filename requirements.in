@@ -1,7 +1,9 @@
 beautifulsoup4
 fastapi
+hiredis
 httpx
 ics
+redis
 redis
 slowapi
 uvicorn

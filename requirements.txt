@@ -30,6 +30,8 @@ h11==0.14.0
     # via
     #   httpcore
     #   uvicorn
+hiredis==2.2.3
+    # via -r requirements.in
 httpcore==0.17.0
     # via httpx
 httpx==0.24.0

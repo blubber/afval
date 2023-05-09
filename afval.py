@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import json
+import pickle
 import re
 import typing as t
 import urllib.parse
@@ -10,15 +11,23 @@ from enum import Enum
 import fastapi as f
 import httpx
 import ics
+import redis.asyncio as redis
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+cache = redis.Redis(host="redis")
+
 
 class NotFound(Exception):
     """Raised when a postcal_code + number doesn't result in data."""
+
+
+class Provider(str, Enum):
+    cleanprofs = "cleanprofs"
+    afvalstoffen = "afvalstoffen"
 
 
 class WasteType(str, Enum):
@@ -28,6 +37,10 @@ class WasteType(str, Enum):
     plastic = "plastic"
     tree = "tree"
 
+
+NOT_FOUND = "__not_found__"
+REDIS_POSITIVE_CACHE_EXPIRE = 3600
+REDIS_NEGATIVE_CACHE_EXPIRE = 300
 
 WASTE_TYPE_LABELS = {
     WasteType.non_recyclable: "Non Recyclable",
@@ -263,10 +276,71 @@ def create_calander(
     return calendar
 
 
-@app.get("/cleanprofs.json")
+async def fetch_cached_data_for(
+    key: str,
+) -> list[tuple[datetime.date, WasteType]] | None:
+    result = await cache.get(key)
+
+    if result == NOT_FOUND:
+        return NotFound
+    elif result is None:
+        return None
+
+    return pickle.loads(result)
+
+
+async def cache_negative_result(key: str) -> None:
+    await cache.set(key, NOT_FOUND)
+    await cache.expire(key, REDIS_NEGATIVE_CACHE_EXPIRE)
+
+
+async def cache_positive_result(
+    key: str, items: list[tuple[datetime.date, WasteType]]
+) -> None:
+    data = pickle.dumps(items)
+    await cache.set(key, data)
+    await cache.expire(key, REDIS_POSITIVE_CACHE_EXPIRE)
+
+
+async def fetch_data_for(
+    provider: Provider,
+    postal_code: str,
+    number: str,
+    addition: str = "",
+) -> list[tuple[datetime.date, WasteType]]:
+    key = f"{provider.value}-{postal_code}-{number}-{addition}"
+    items = await fetch_cached_data_for(key)
+
+    if items is NotFound:
+        raise f.HTTPException(status_code=404)
+    elif items is not None:
+        return items
+
+    try:
+        if provider is Provider.cleanprofs:
+            items = await cleanprofs_download_items(postal_code, number)
+        elif provider is Provider.afvalstoffen:
+            items = await afvalstoffen_get_dates(postal_code, number, addition)
+    except NotFound:
+        await cache_negative_result(key)
+        raise f.HTTPException(status_code=404)
+    except:
+        raise f.HTTPException(status_code=500)
+
+    await cache_positive_result(key, items)
+    return items
+
+
+@app.get("/{provider}.json")
 @limiter.limit("5/minute")
-async def cleanprofs_json(request: f.Request, postal_code: str, number: str):
-    items = await call_cached(cleanprofs_download_items, postal_code, number)
+async def cleanprofs_json(
+    request: f.Request,
+    provider: Provider,
+    postal_code: str,
+    number: str,
+    addition: str = "",
+):
+    items = await fetch_data_for(provider, postal_code, number, addition)
     return [
         {
             "date": date,
@@ -276,41 +350,11 @@ async def cleanprofs_json(request: f.Request, postal_code: str, number: str):
     ]
 
 
-@app.get("/afvalstoffen.json")
-@limiter.limit("5/minute")
-async def afvalstoffen_json(
-    request: f.Request, postal_code: str, number: str, addition: None | str = None
-):
-    addition = addition or ""
-    items = await call_cached(afvalstoffen_get_dates, postal_code, number, addition)
-    return items
-
-
-@app.get("/cleanprofs.ics")
+@app.get("/{provider}.ics")
 @limiter.limit("5/minute")
 async def cleanprofs_ics(
     request: f.Request,
-    postal_code: str,
-    number: str,
-    begin: datetime.time = datetime.time(7),
-    end: datetime.time = datetime.time(19),
-    alarms: list[datetime.timedelta] = f.Query(
-        [datetime.timedelta(-12), datetime.timedelta(0)]
-    ),
-):
-    items = await call_cached(cleanprofs_download_items, postal_code, number)
-
-    calendar = create_calander(
-        items, item_prefix="Cleanprofs", begin=begin, end=end, alarms=alarms[:2]
-    )
-
-    return f.Response(calendar.serialize(), media_type="text/calendar")
-
-
-@app.get("/afvalstoffen.ics")
-@limiter.limit("5/minute")
-async def afvalstoffen_ics(
-    request: f.Request,
+    provider: Provider,
     postal_code: str,
     number: str,
     addition: str = "",
@@ -320,10 +364,9 @@ async def afvalstoffen_ics(
         [datetime.timedelta(-12), datetime.timedelta(0)]
     ),
 ):
-    items = await call_cached(afvalstoffen_get_dates, postal_code, number, addition)
-
+    items = await fetch_data_for(provider, postal_code, number, addition)
+    prefix = "Cleanprofs" if provider is Provider.cleanprofs else "Afval"
     calendar = create_calander(
-        items, item_prefix="Afval", begin=begin, end=end, alarms=alarms[:2]
+        items, item_prefix=prefix, begin=begin, end=end, alarms=alarms[:2]
     )
-
     return f.Response(calendar.serialize(), media_type="text/calendar")
